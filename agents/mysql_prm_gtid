@@ -544,6 +544,7 @@ END
 
 set_master_score() {
    # Simpler than the non-gtid version since crashed master TS isn't used
+   ocf_log info "debug: inside set_master_score"
    $CRM_MASTER -v $1
 }
 
@@ -554,6 +555,7 @@ set_read_only() {
    # setups.
    # Returns $OCF_SUCCESS if the operation succeeds, or
    # $OCF_ERR_GENERIC if it fails.
+   ocf_log info "debug: inside set_read_only"
    local ro_val
    if ocf_is_true $1; then
       ro_val="on"
@@ -566,6 +568,7 @@ set_read_only() {
 
 get_read_only() {
    # Check if read-only is set
+   ocf_log info "debug: inside get_read_only"
    local read_only_state
    
    read_only_state=`mysql_run -Q -sw -O $MYSQL -N $MYSQL_OPTIONS_REPL \
@@ -582,6 +585,7 @@ is_slave() {
    # Determine whether the machine is currently running as a MySQL
    # slave, as determined per SHOW SLAVE STATUS. Returns 1 if SHOW
    # SLAVE STATUS creates an empty result set, 0 otherwise.
+   ocf_log info "debug: inside is_slave"
    local rc
    local tmpfile
    
@@ -615,11 +619,12 @@ is_slave() {
 
 parse_slave_info() {
    # Extracts field $1 from result of "SHOW SLAVE STATUS\G" from file $2
+   ocf_log info "debug: inside parse_slave_info"
    sed -ne "s/^.* $1: \(.*\)$/\1/p" < $2
 }
 
 get_slave_info() {
-   
+   ocf_log info "debug: inside get_slave_info"
    local mysql_options tmpfile
    
    # with GTID, it is possible that $master_log_file is not defined yet, 
@@ -667,6 +672,7 @@ get_slave_info() {
 
 check_slave() {
    # Checks slave status
+   ocf_log info "debug: inside check_slave"
    local rc new_master
    
    get_slave_info
@@ -855,6 +861,7 @@ check_slave() {
 set_master() {
    # has we are on 5.6 with GTID and Auto_Position = 1
    # we still need to verify this ... but TODO
+   ocf_log info "debug: inside set_master"
    local new_master master_log_file master_log_pos new_master_info
    local master_params new_master_log_file new_master_log_pos
    local bootstrap_master
@@ -885,8 +892,9 @@ set_master() {
          ocf_log warn "Auto position is not enabled, we force it"
          mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
          -e "STOP SLAVE;CHANGE MASTER TO \
-            MASTER_AUTO_POSITION=1; \
-            START SLAVE;"
+            MASTER_AUTO_POSITION=1 ,\
+            MASTER_SSL=1; \
+	    START SLAVE;"
       fi
       
       # with GTID, it is possible that $master_log_file is not defined yet, 
@@ -916,7 +924,8 @@ set_master() {
             MASTER_PORT=$OCF_RESKEY_replication_port, \
             MASTER_USER='$OCF_RESKEY_replication_user', \
             MASTER_PASSWORD='$OCF_RESKEY_replication_passwd', \
-            MASTER_AUTO_POSITION=1 \
+            MASTER_AUTO_POSITION=1, \
+	    MASTER_SSL=1 \
          $OCF_RESKEY_replication_options ;START SLAVE;"
       fi
    fi
@@ -930,7 +939,7 @@ unset_master(){
    # host, then there's nothing to do. But we do log a warning as
    # no-one but the CRM should be touching the MySQL master/slave
    # configuration.
-   
+   ocf_log info "debug: inside unset_master"
    is_slave
    rc=$?
    if [ $rc -ne 0 ]; then
@@ -1043,7 +1052,7 @@ unset_master(){
       # Next we gather the last executed gtid from the master
       slave_status_file="${HA_RSCTMP}/slave_nofiy.${OCF_RESOURCE_INSTANCE}"
    
-      mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select replace(variable_value,'\n','') as variable_value from information_schema.global_variables where variable_name in ('gtid_executed')" > $slave_status_file               
+      mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select replace(variable_value,'\n','') as variable_value from performance_schema.global_variables where variable_name in ('gtid_executed')" > $slave_status_file               
    
       executed_gtid=`cat $slave_status_file | sed "s/.*$master_uuid:[0-9]*-\([0-9]*\).*/\1/"`
    
@@ -1084,12 +1093,14 @@ unset_master(){
 
 # Start replication as slave
 start_slave() {
+   ocf_log info "debug: inside start_slave"
    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
    -e "START SLAVE"
 }
 
 # Set the attribute controlling the readers VIP
 set_reader_attr() {
+   ocf_log info "debug: inside set_reader_attr"
    local curr_attr_value
    
    curr_attr_value=$(get_reader_attr)
@@ -1110,6 +1121,7 @@ set_reader_attr() {
 }
 
 is_master_side() {
+   ocf_log info "debug: inside is_master_side"
    #Returns true (0) if this cluster has a grant for the booth ticket OCF_RESKEY_booth_master_ticket
    local ticket crmTicketRet
    
@@ -1135,6 +1147,7 @@ is_master_side() {
 
 # get the attribute controlling the readers VIP
 get_reader_attr() {
+   ocf_log info "debug: inside get_reader_attr"
    local attr_value
    local rc
    
@@ -1150,20 +1163,22 @@ get_reader_attr() {
 
 # Stores data for MASTER STATUS from MySQL
 update_data_master_status() {
+   ocf_log info "debug: inside update_data_master_status"
    local server_uuid last_gtid
    master_status_file="${HA_RSCTMP}/master_status.${OCF_RESOURCE_INSTANCE}"
    
-   mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select variable_name,replace(variable_value,'\n','') as variable_value from information_schema.global_variables where variable_name in ('server_uuid','gtid_executed')" > $master_status_file
+   mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select variable_name,replace(variable_value,'\n','') as variable_value from performance_schema.global_variables where variable_name in ('server_uuid','gtid_executed')" > $master_status_file
    
 }
 
 # Returns the master status from the global variable, namely the uuid and last_gtid.
 # should be call after update_data_master_status for tmpfile
 get_master_status() {
+   ocf_log info "debug: inside get_master_status"
    local server_uuid last_gtid
    
-   server_uuid=`cat $master_status_file | grep SERVER_UUID | awk '{ print $2 }'`
-   last_gtid=`cat $master_status_file | grep GTID_EXECUTED | sed "s/.*$server_uuid:[0-9]*-\([0-9]*\).*/\1/"`
+   server_uuid=`cat $master_status_file | grep -i SERVER_UUID | awk '{ print $2 }'`
+   last_gtid=`cat $master_status_file | grep -i GTID_EXECUTED | sed "s/.*$server_uuid:[0-9]*-\([0-9]*\).*/\1/"`
    
    echo "$server_uuid:$last_gtid"
 }
@@ -1175,6 +1190,7 @@ get_master_status() {
 # The ${INSTANCE_ATTR_NAME}_MYSQL_MASTER_IP is the IP address that will be used for the
 # change master to command.
 get_local_ip() {
+   ocf_log info "debug: inside get_local_ip"
    local IP
    IP=`$CRM_ATTR -l forever -n ${INSTANCE_ATTR_NAME}_mysql_master_IP -q -G`
    if [ ! $? -eq 0 ]; then
@@ -1187,6 +1203,7 @@ get_local_ip() {
 # Determine if the datadir is full or almost full, the threshold is 97%
 check_datadir_state() {
    # Get the free space of the binlogdir
+   ocf_log info "debug: inside check_datadir_state"
    FREE_SPC_PCT=`/bin/df -P $OCF_RESKEY_datadir | /bin/grep -v Filesystem \
                         | /bin/sed  -e 's/ \+/ /g' | /usr/bin/cut -d' ' -f 5 \
                         | /usr/bin/tr -d '%'`
@@ -1206,6 +1223,7 @@ check_datadir_state() {
 # Functions invoked by resource manager actions
 
 mysql_validate() {
+   ocf_log info "debug: inside mysql_validate"
    check_binary $OCF_RESKEY_binary
    check_binary  $OCF_RESKEY_client_binary
    
@@ -1238,6 +1256,7 @@ mysql_validate() {
 # $1 the loglevel to use (mandatory)
 # $2 Override async_stop if 1, default to 0
 mysql_status() {
+   ocf_log info "debug: inside mysql_status"
    local last_restart_ts
    local kill_exit_code
    local witness_pid
@@ -1341,6 +1360,7 @@ mysql_status() {
 }
 
 mysql_monitor() {
+   ocf_log info "debug: inside mysql_monitor"
    local rc
    local status_loglevel="err"
    local master_resource
@@ -1432,6 +1452,7 @@ mysql_monitor() {
 
 # Start MySQL in the master-slave context
 mysql_start() {
+   ocf_log info "debug: inside mysql_start"
    local current_status
    
    if ocf_is_ms; then
@@ -1537,6 +1558,7 @@ mysql_start() {
 
 # low level MySQL start
 mysql_start_low() {
+   ocf_log info "debug: inside mysql_start_low"
    touch $OCF_RESKEY_log
    chown $OCF_RESKEY_user:$OCF_RESKEY_group $OCF_RESKEY_log
    chmod 0640 $OCF_RESKEY_log
@@ -1647,7 +1669,7 @@ mysql_start_low() {
 }
 
 mysql_stop() {
-   
+   ocf_log info "debug: inside mysql_stop"
    if ocf_is_ms; then
       # clear preference for becoming master
       $CRM_MASTER -D
@@ -1660,6 +1682,10 @@ mysql_stop() {
    # as this certainly contains the file we need with the PID
    if [ ! -f ${OCF_RESKEY_pid}.starting ]; then
       ocf_log info "MySQL is not running"
+      return $OCF_SUCCESS
+   fi
+   if [ ! -e $OCF_RESKEY_pid ]; then
+      ocf_log $1 "MySQL is not running"
       return $OCF_SUCCESS
    fi
    
@@ -1718,6 +1744,7 @@ mysql_stop() {
 }
 
 mysql_promote() {
+   ocf_log info "debug: inside mysql_promote"
    local master_info
    
    if ( ! mysql_status err ); then
@@ -1752,6 +1779,7 @@ mysql_promote() {
 }
 
 mysql_demote() {
+   ocf_log info "debug: inside mysql_demote"
    if ! mysql_status err; then
       set_master_score 0
       exit $OCF_SUCCESS
@@ -1766,6 +1794,7 @@ mysql_demote() {
 mysql_notify() {
    # If not configured as a Stateful resource, we make no sense of
    # notifications.
+   ocf_log info "debug: inside mysql_notify"
    if ! ocf_is_ms; then
       ocf_log info "This agent makes no use of notifications unless running in master/slave mode."
       return $OCF_SUCCESS
@@ -1906,6 +1935,7 @@ mysql_notify() {
 # Adapted from ocf_run.
 #
 mysql_run() {
+   ocf_log info "debug: inside mysql_run"
    local rc
    local output outputfile
    local verbose=1
