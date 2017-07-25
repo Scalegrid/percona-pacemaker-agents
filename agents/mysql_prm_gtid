@@ -1087,7 +1087,8 @@ unset_master(){
       set_master_score $master_score
    fi
    
-    ocf_log info "debug neeraj: printing the read only value : ${ro_val}"
+    ocf_log info "debug : remove super_read_only for reset slave"
+
     mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
        -e "SET GLOBAL super_read_only=0"
 
@@ -1099,7 +1100,8 @@ unset_master(){
       exit $OCF_ERR_GENERIC
    fi
 
-    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+   ocf_log info "debug : Add super_read_only for reset slave"
+   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
         -e "SET GLOBAL super_read_only=1"   
 }
 
