@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #
 #
@@ -40,6 +39,7 @@
 #   OCF_RESKEY_test_table
 #   OCF_RESKEY_test_user
 #   OCF_RESKEY_test_passwd
+#   OCF_RESKEY_replicaConfig
 #   OCF_RESKEY_enable_creation
 #   OCF_RESKEY_additional_parameters
 #   OCF_RESKEY_log
@@ -95,8 +95,9 @@ fi
 OCF_RESKEY_client_binary_default="mysql"
 OCF_RESKEY_binary_prefix_default=""
 OCF_RESKEY_test_user_default="root"
-OCF_RESKEY_test_table_default="mysql.user"
+OCF_RESKEY_test_table_default="mysql.PRM_TEST_TABLE"
 OCF_RESKEY_test_passwd_default=""
+OCF_RESKEY_replicaConfig_default="0"
 OCF_RESKEY_enable_creation_default=0
 OCF_RESKEY_additional_parameters_default=""
 OCF_RESKEY_replication_port_default="3306"
@@ -123,6 +124,7 @@ MYSQL_SBINDIR=`dirname ${OCF_RESKEY_binary}`
 : ${OCF_RESKEY_test_user=${OCF_RESKEY_test_user_default}}
 : ${OCF_RESKEY_test_table=${OCF_RESKEY_test_table_default}}
 : ${OCF_RESKEY_test_passwd=${OCF_RESKEY_test_passwd_default}}
+: ${OCF_RESKEY_replicaConfig=${OCF_RESKEY_replicaConfig_default}}
 : ${OCF_RESKEY_enable_creation=${OCF_RESKEY_enable_creation_default}}
 : ${OCF_RESKEY_additional_parameters=${OCF_RESKEY_additional_parameters_default}}
 : ${OCF_RESKEY_replication_user=${OCF_RESKEY_replication_user_default}}
@@ -318,6 +320,14 @@ MySQL test user password
 </longdesc>
 <shortdesc lang="en">MySQL test user password</shortdesc>
 <content type="string" default="${OCF_RESKEY_test_passwd_default}" />
+</parameter>
+
+<parameter name="replicaConfig" unique="0" required="0">
+<longdesc lang="en">
+MySQL replication mode
+</longdesc>
+<shortdesc lang="en">MySQL replication mode</shortdesc>
+<content type="string" default="${OCF_RESKEY_replicaConfig_default}" />
 </parameter>
 
 <parameter name="enable_creation" unique="0" required="0">
@@ -543,12 +553,38 @@ END
 
 # Convenience functions
 
+# @MySQLErrorSafe - doesn't call MySQL
 set_master_score() {
    # Simpler than the non-gtid version since crashed master TS isn't used
-   ocf_log info "debug: inside set_master_score"
+   ocf_log debug "debug: inside set_master_score"
    $CRM_MASTER -v $1
 }
 
+chk_and_set_semi_sync_repl_master() {
+    ocf_log debug "debug: chk_and_set_semi_sync_repl_master"
+
+    if [ "$OCF_RESKEY_replicaConfig" = "1" ]; then
+         mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+        -e "call mysql.EnableSemiSyncMaster();"
+    fi
+
+}
+
+chk_and_set_semi_sync_repl_slave() {
+    ocf_log debug "debug: chk_and_set_semi_sync_repl_slave"
+
+    if [ "$OCF_RESKEY_replicaConfig" = "1" ]; then
+         ocf_log debug "debug: Enabling semi-sync on slave"
+         mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+        -e "call mysql.EnableSemiSyncSlave();"
+        #Give it some time to take effect before returning
+        sleep 3
+    fi
+
+}
+
+
+# @MySQLErrorUnSafe - callers should check return value
 set_read_only() {
    # Sets or unsets read-only mode. Accepts one boolean as its
    # optional argument. If invoked without any arguments, defaults to
@@ -556,24 +592,30 @@ set_read_only() {
    # setups.
    # Returns $OCF_SUCCESS if the operation succeeds, or
    # $OCF_ERR_GENERIC if it fails.
-   ocf_log info "debug: inside set_read_only"
+   ocf_log debug "debug: inside set_read_only"
    local ro_val
+   local ro_val_int
    if ocf_is_true $1; then
       ro_val="on"
+      ro_val_int=1
    else
       ro_val="off"
+      ro_val_int=0
    fi
-    
-   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-        -e "SET GLOBAL super_read_only=${ro_val}"
+   
+    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+       -e "call mysql.setReadOnly(${ro_val_int});"
 
    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-        -e "SET GLOBAL read_only=${ro_val}"
+        -e "call mysql.setSuperReadOnly(${ro_val_int});"
+    
 }
 
+# @MySQLErrorUnSafe - connects to MySQL.
+# However error checks on this function can be ignored
 get_read_only() {
    # Check if read-only is set
-   ocf_log info "debug: inside get_read_only"
+   ocf_log debug "debug: inside get_read_only"
    local read_only_state
    
    read_only_state=`mysql_run -Q -sw -O $MYSQL -N $MYSQL_OPTIONS_REPL \
@@ -586,11 +628,15 @@ get_read_only() {
    fi
 }
 
+# @MySQLErrorUnSafe: WITH disclaimers
+# get_read_only ~ can be ignored
+# get_slave_info - return value from Safe method is percolated up and interpreted
+# by callers as a boolean ret val
 is_slave() {
    # Determine whether the machine is currently running as a MySQL
    # slave, as determined per SHOW SLAVE STATUS. Returns 1 if SHOW
    # SLAVE STATUS creates an empty result set, 0 otherwise.
-   ocf_log info "debug: inside is_slave"
+   ocf_log debug "debug: inside is_slave"
    local rc
    local tmpfile
    
@@ -622,14 +668,18 @@ is_slave() {
    
 }
 
+# @MySQLErrorSafe - doesn't touch MySQL
 parse_slave_info() {
    # Extracts field $1 from result of "SHOW SLAVE STATUS\G" from file $2
-   ocf_log info "debug: inside parse_slave_info"
+   ocf_log debug "debug: inside parse_slave_info"
    sed -ne "s/^.* $1: \(.*\)$/\1/p" < $2
 }
 
+# This function is @MySQLErrorSafe - if the tmpfile doesn't exist
+# or is empty (as is the case when MySQL connection is not made) it will
+# return an error
 get_slave_info() {
-   ocf_log info "debug: inside get_slave_info"
+   ocf_log debug "debug: inside get_slave_info"
    local mysql_options tmpfile
    
    # with GTID, it is possible that $master_log_file is not defined yet, 
@@ -666,7 +716,7 @@ get_slave_info() {
          
          
          
-         ocf_log err "check_slave invoked on an instance that is not a replication slave."
+         ocf_log err "get_slave_info invoked on an instance that is not a replication slave."
          rm -f $tmpfile
          return $OCF_ERR_GENERIC
       fi
@@ -675,14 +725,17 @@ get_slave_info() {
    fi
 }
 
+# @MySQLErrorUnSafe/ - Howeve that doesn't matter:
+# There is ONLY ONE instance of a call to this method, from mysql_monitor().
+# This method ONLY returns when the monitor checks can continue, else it exits
 check_slave() {
    # Checks slave status
-   ocf_log info "debug: inside check_slave"
+   ocf_log debug "debug: inside check_slave"
    local rc new_master
-   
+
    get_slave_info
    rc=$?
-   
+
    if [ $rc -eq 0 ]; then
       # Did we receive an error other than max_connections?
       if [ $last_errno -ne 0 -a $last_errno -ne "$MYSQL_TOO_MANY_CONN_ERR" ]; then
@@ -690,16 +743,16 @@ check_slave() {
          # diverged from its master. Make sure this resource
          # doesn't restart in place.
          ocf_log err "MySQL instance configured for replication, but replication has failed."
-         
+
          # Just pull the reader VIP away, killing MySQL here would be pretty evil
          # on a loaded server
          set_reader_attr 0
-         
+
          #Since replication is broken, not suitable to be a master
          set_master_score -INF
-         
+
          exit $OCF_SUCCESS
-         
+
       fi
       
       # If we got max_connections, let's only remove the vip
@@ -732,24 +785,24 @@ check_slave() {
             exit $OCF_SUCCESS
             
          elif [ "$slave_sql" == 'Yes' ]; then
-            # If the slq thread is running, it is an issue with the io thread
+            # If the sql thread is running, it is an issue with the io thread
             # let's try to restart it
-            
+
             if [ "$slave_io_state" != "" ]; then
                # The io thread is running but is not connected, let's restart it.
-               mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-               -e "STOP SLAVE IO_THREAD"
+                mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+                -e "call mysql.StopSlaveIOThread();" 
             fi
-            
+
             # At this point, the io_thread should be stopped.
             # let's try to start it again.
-            
-            mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-            -e "START SLAVE IO_THREAD"
-            
+
+             mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+             -e "call mysql.StartSlaveIOThread();" 
+
             # We give some time to connect
             sleep 2
-            
+
             get_slave_info
             rc=$?
             if [ $rc -eq 0 -a "$slave_io" == 'Yes' ]; then
@@ -759,24 +812,24 @@ check_slave() {
             fi
          fi
       fi
-      
+
       if [ "$slave_sql" != 'Yes' ]; then
          # We don't have a replication SQL thread running. Not a
          # good thing. Try to recoved by restarting the SQL thread
          # and remove reader vip.  Prevent MySQL restart.
          ocf_log err "MySQL Slave SQL threads currently not running."
-         
+
          # Remove reader vip
          set_reader_attr 0
          set_master_score -INF
-         
+
          # Check that the flock tool exists first
          if type flock &>/dev/null; then
             (
                flock -xn 8
                if [ $? -eq 0 ]; then
-                  mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-                  -e "START SLAVE"
+                   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+                    -e "call mysql.startSlave();" 
                else
                   ocf_log info "Unable to lock $OCF_RESKEY_backup_lockfile. Not starting slave."
                fi
@@ -784,13 +837,13 @@ check_slave() {
          else
             # try to restart slave
             mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-            -e "START SLAVE"
+                    -e "call mysql.startSlave();" 
          fi
-         
+
          # Return success to prevent a restart
          exit $OCF_SUCCESS
       fi
-      
+
       if ocf_is_true $OCF_RESKEY_evict_outdated_slaves; then
          # We're supposed to bail out if we lag too far
          # behind. Let's check our lag.
@@ -809,25 +862,33 @@ check_slave() {
          test $secs_behind -eq 0 2>/dev/null
          if [ $? -eq 2 ]; then
             # SBM is undefined or not an integer
-            master_pref=0
+           # master_pref=0
+           # unless SBM is undefined, we will not allow it to be master
+             master_pref=-2147483640
             set_reader_attr 0
          else
-            master_pref=$((${OCF_RESKEY_max_slave_lag}-${secs_behind}))
-            if [ $master_pref -lt 0 ]; then
-               # Sanitize a below-zero preference to just zero
-               master_pref=0
-            fi
+            #master_pref=$((${OCF_RESKEY_max_slave_lag}-${secs_behind}))
+            #if [ $master_pref -lt 0 ]; then
+            # Sanitize a below-zero preference to just zero
+            #  master_pref=0
+            #fi
             
+            # if SBM is not 0, we will not allow the slave to be a master
+            if [ $secs_behind -ne 0 ]; then
+               ocf_log info "SBM is not zero. Hence preventing the slave to be a master"
+               master_pref=-2147483640
+            fi
+
             if [ $secs_behind -gt $OCF_RESKEY_max_slave_lag ]; then
                set_reader_attr 0
             else
                set_reader_attr 1
             fi
-            
+
             #Edge case verification, check if on the right master
             set_master nologging
          fi
-         
+
          # Is the datadir almost full
          if check_datadir_state; then
             set_master_score $master_pref
@@ -841,13 +902,13 @@ check_slave() {
       # Instance produced an empty "SHOW SLAVE STATUS" output --
       # instance is not a slave
       # TODO: Needs to handle when get_slave_info will return too many connections error
-      
+
       if [ $MYSQL_LAST_ERR -eq "$MYSQL_TOO_MANY_CONN_ERR" ]; then
          # Remove the vip
          set_reader_attr 0
          return $OCF_SUCCESS
       fi
-      
+
       # An empty status could happen when a master is demote in a
       # geo DR setup, let's check
       if [ $MYSQL_LAST_ERR -eq 0 -a $glb_master_exists -eq 1 ]; then
@@ -857,16 +918,17 @@ check_slave() {
          set_master
          return $OCF_SUCCESS
       fi
-      
+
       ocf_log err "check_slave invoked on an instance that is not a replication slave."
       exit $OCF_ERR_GENERIC
    fi
 }
 
+# @MySQLErrorUnSafe - multiple calls to MySQL where return values are unchecked
 set_master() {
    # has we are on 5.6 with GTID and Auto_Position = 1
    # we still need to verify this ... but TODO
-   ocf_log info "debug: inside set_master"
+   ocf_log debug "debug: inside set_master"
    local new_master master_log_file master_log_pos new_master_info
    local master_params new_master_log_file new_master_log_pos
    local bootstrap_master
@@ -895,19 +957,20 @@ set_master() {
       # so we need to stop replication and reconfigure it 
       if [ "$auto_position" == "0" ]; then
          ocf_log warn "Auto position is not enabled, we force it"
+      mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+         -e "call mysql.StopSlave();" 
+         
          mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-         -e "STOP SLAVE;CHANGE MASTER TO \
-            MASTER_AUTO_POSITION=1 ,\
-            MASTER_SSL=1; \
-       START SLAVE;"
+         -e "call mysql.changeMasterAutoposition();"   
+         
       fi
       
       # with GTID, it is possible that $master_log_file is not defined yet, 
       # as it connects, with MASTER_AUTO_POSITION=1, it needs to find the
       # binlog file and position, using $master_uuid instead.
       if [ "$master_uuid" -a "$new_master" = "$master_host" ]; then
-         #  master_params=", MASTER_LOG_FILE='$master_log_file', \
-         #      MASTER_LOG_POS=$master_log_pos"
+         #	master_params=", MASTER_LOG_FILE='$master_log_file', \
+         #	    MASTER_LOG_POS=$master_log_pos"
          if [ "$1" = "nologging" ]; then
             :
          else
@@ -924,16 +987,127 @@ set_master() {
       # reset with RESET MASTER.
       
       if [ $bootstrap_master -eq 0 ]; then
-         mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-         -e "STOP SLAVE;CHANGE MASTER TO MASTER_HOST='$new_master', \
-            MASTER_PORT=$OCF_RESKEY_replication_port, \
-            MASTER_USER='$OCF_RESKEY_replication_user', \
-            MASTER_PASSWORD='$OCF_RESKEY_replication_passwd', \
-            MASTER_AUTO_POSITION=1, \
-       MASTER_SSL=1 \
-         $OCF_RESKEY_replication_options ;START SLAVE;"
+         
+        mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+         -e "call mysql.changeMasterTo('$new_master', $OCF_RESKEY_replication_port, '$OCF_RESKEY_replication_user', '$OCF_RESKEY_replication_passwd');"
+        #check and set semi sync repl on slave before starting slave
+        chk_and_set_semi_sync_repl_slave
+        mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+                    -e "call mysql.startSlave();" 
       fi
    fi
+}
+
+unset_master_from_monitor() {
+
+   ocf_log debug "debug: inside unset_master_from_monitor"
+   is_slave
+   rc=$?
+   if [ $rc -ne 0 ]; then
+      ocf_log warn "Attempted to unset the replication master on an instance that is not configured as a replication slave"
+      return $OCF_SUCCESS
+   fi
+   
+   local tmpfile
+   tmpfile=`mktemp ${HA_RSCTMP}/unset_master.${OCF_RESOURCE_INSTANCE}.XXXXXX`
+   
+   # Check for 2 conditions.
+   # 1: Slave-IO thread is stopped, 2: SQL thread has processed all data
+   # Let's wait for the last bits
+
+   get_slave_info
+   rc=$?
+      
+   # Is the slave_io thread running?
+   if [ "$slave_io" == 'Yes' ]; then
+         ocf_log info "Slave IO thread is running - check back later"
+         return $OCF_SUCCESS
+    fi
+      
+    mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL \
+     -e 'SHOW PROCESSLIST\G' > $tmpfile
+    
+    #check if sql thread has caught up!
+    if ! grep -i 'Has read all relay log' $tmpfile >/dev/null; then
+         ocf_log info "MySQL slave has not finished processing relay log - check back later"
+          return $OCF_SUCCESS
+    fi
+
+    rm -f $tmpfile
+   
+   # Reset the last_unset flag to indicate that slave has caught up!!
+    $CRM_ATTR -l reboot --name last_unset -v 0
+   # Now, stop all slave activity and unset the master host
+    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+         -e "call mysql.StopSlave();" 
+
+   if [ $? -gt 0 ]; then
+      ocf_log err "Error stopping rest slave threads"
+      exit $OCF_ERR_GENERIC
+   fi
+      
+   # Now we need to publish a new master_score
+   
+   # Get the last repl. status from the master, it may happens after a crash and
+   # pacemaker may take longer to reply so we loop
+   local master_status_attr
+   local Iter=5
+   while [ "$Iter" -gt 0 ]; do
+      master_status_attr=`$CRM_ATTR_REPL_STATUS --query`
+      if [ "$?" -eq 0 ]; then
+         break;
+      else
+         sleep 1
+         let Iter-=1
+      fi
+   done
+         
+   if [ $? -eq 0 ]; then
+      # There's a master status entry although we don't know if it is
+      # a valid one
+      master_uuid=`echo $master_status_attr | cut -d: -f1`
+      last_gtid=`echo $master_status_attr | cut -d: -f2`
+
+      # Next we gather the last executed gtid from the master
+      slave_status_file="${HA_RSCTMP}/slave_nofiy.${OCF_RESOURCE_INSTANCE}"
+   
+      mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select replace(variable_value,'\n','') as variable_value from performance_schema.global_variables where variable_name in ('gtid_executed')" > $slave_status_file               
+   
+      executed_gtid=`cat $slave_status_file | sed "s/.*$master_uuid:[0-9]*-\([0-9]*\).*/\1/"`
+   
+      rm -f $slave_status_file
+   
+      master_score=$((1000000000+$executed_gtid-$last_gtid))
+   
+      # now, the caps, the upper cap is unlikely
+      if [ $master_score -gt 2147483647 ]; then
+         master_score=2147483647
+      fi
+
+      # lower bond, also unlikely
+      if [ $master_score -lt -2147483647 ]; then
+         master_score=-2147483647
+      fi
+      
+      # prevent failover if master_score is less than 1000000000 which means slave is lagging behind the master
+      if [ $master_score -lt 1000000000 ]; then
+         master_score=-2147483647
+      fi
+   
+      set_master_score $master_score
+   fi
+   
+   set_read_only OFF
+
+   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+   -e "RESET SLAVE /*!50516 ALL */;"
+   if [ $? -gt 0 ]; then
+      ocf_log err "Failed to reset slave"
+      exit $OCF_ERR_GENERIC
+   fi
+   
+   set_read_only ON
+
 }
 
 unset_master(){
@@ -944,7 +1118,7 @@ unset_master(){
    # host, then there's nothing to do. But we do log a warning as
    # no-one but the CRM should be touching the MySQL master/slave
    # configuration.
-   ocf_log info "debug: inside unset_master"
+   ocf_log debug "debug: inside unset_master"
    is_slave
    rc=$?
    if [ $rc -ne 0 ]; then
@@ -997,7 +1171,8 @@ unset_master(){
    # Now, stop the slave I/O thread and wait for relay log
    # processing to complete
    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-   -e "STOP SLAVE IO_THREAD"
+         -e "call mysql.StopSlaveIOThread();" 
+
    if [ $? -gt 0 ]; then
       ocf_log err "Error stopping slave IO thread"
       rm -f $tmpfile
@@ -1011,6 +1186,11 @@ unset_master(){
          ocf_log info "MySQL slave has finished processing relay log"
          break
       fi
+      # with sql threads enables - we see this msg when slave has completed caught up!
+      if grep -i 'Slave has read all relay log; waiting for more updates' $tmpfile >/dev/null; then
+        ocf_log info "MySQL Slave has finished processing relay log"
+        break
+      fi
       if ! grep -q 'system user' $tmpfile; then
          ocf_log info "Slave not runnig - not waiting to finish"
          break
@@ -1021,9 +1201,12 @@ unset_master(){
    
    rm -f $tmpfile
    
+   # Reset the last_unset flag to indicate that slave has caught up!!
+    $CRM_ATTR -l reboot --name last_unset -v 0
    # Now, stop all slave activity and unset the master host
-   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-   -e "STOP SLAVE"
+    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+         -e "call mysql.StopSlave();" 
+
    if [ $? -gt 0 ]; then
       ocf_log err "Error stopping rest slave threads"
       exit $OCF_ERR_GENERIC
@@ -1058,9 +1241,18 @@ unset_master(){
       slave_status_file="${HA_RSCTMP}/slave_nofiy.${OCF_RESOURCE_INSTANCE}"
    
       mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select replace(variable_value,'\n','') as variable_value from performance_schema.global_variables where variable_name in ('gtid_executed')" > $slave_status_file               
-   
-      executed_gtid=`cat $slave_status_file | sed "s/.*$master_uuid:[0-9]*-\([0-9]*\).*/\1/"`
-   
+      
+      # First parse for pattern like UUID:X-Y, if matches then gtid is Y
+      # If no match parse for pattern like UUID:X, if match then gtid is X
+      # If no match then gtid is 0
+      executed_gtid=`cat $slave_status_file | sed -n "s/.*$master_uuid:[0-9]*-\([0-9]*\).*/\1/p"`
+      if [ ! "$executed_gtid" ]; then
+            executed_gtid=`cat $slave_status_file | sed -n "s/.*$master_uuid:\([0-9]*\).*/\1/p"`
+            if [ ! "$executed_gtid" ]; then
+                executed_gtid=0
+            fi
+      fi
+
       rm -f $slave_status_file
    
       # Let's establish the master score based on the following
@@ -1083,38 +1275,40 @@ unset_master(){
       if [ $master_score -lt -2147483647 ]; then
          master_score=-2147483647
       fi
+      
+      # prevent failover if master_score is less than 1000000000 which means slave is lagging behind the master
+      if [ $master_score -lt 1000000000 ]; then
+         master_score=-2147483647
+      fi
    
       set_master_score $master_score
    fi
    
-    ocf_log info "debug : remove super_read_only for reset slave"
+   set_read_only OFF
 
-    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-       -e "SET GLOBAL super_read_only=0"
-
-   # neeraj
    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
    -e "RESET SLAVE /*!50516 ALL */;"
    if [ $? -gt 0 ]; then
       ocf_log err "Failed to reset slave"
       exit $OCF_ERR_GENERIC
    fi
-
-   ocf_log info "debug : Add super_read_only for reset slave"
-   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-        -e "SET GLOBAL super_read_only=1"   
+   
+   set_read_only ON
 }
 
+# @MySQLErrorUnSafe - callers should check the return value from this method
 # Start replication as slave
 start_slave() {
-   ocf_log info "debug: inside start_slave"
-   mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
-   -e "START SLAVE"
+    ocf_log info "debug: inside start_slave"
+    chk_and_set_semi_sync_repl_slave
+    mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_REPL \
+         -e "call mysql.startSlave();" 
 }
-
+   
+# @MySQLErrorSafe - doesn't touch MySQL
 # Set the attribute controlling the readers VIP
 set_reader_attr() {
-   ocf_log info "debug: inside set_reader_attr"
+   ocf_log debug "debug: inside set_reader_attr"
    local curr_attr_value
    
    curr_attr_value=$(get_reader_attr)
@@ -1134,8 +1328,9 @@ set_reader_attr() {
    
 }
 
+# @MySQLErrorSafe - doesn't touch MySQL
 is_master_side() {
-   ocf_log info "debug: inside is_master_side"
+   ocf_log debug "debug: inside is_master_side"
    #Returns true (0) if this cluster has a grant for the booth ticket OCF_RESKEY_booth_master_ticket
    local ticket crmTicketRet
    
@@ -1159,9 +1354,10 @@ is_master_side() {
    fi
 }
 
+# @MySQLErrorSafe - doesn't touch MySQL
 # get the attribute controlling the readers VIP
 get_reader_attr() {
-   ocf_log info "debug: inside get_reader_attr"
+   ocf_log debug "debug: inside get_reader_attr"
    local attr_value
    local rc
    
@@ -1175,28 +1371,39 @@ get_reader_attr() {
    
 }
 
+# @MySQLErrorUnSafe - callers should check the return value from this method
 # Stores data for MASTER STATUS from MySQL
 update_data_master_status() {
-   ocf_log info "debug: inside update_data_master_status"
+   ocf_log debug "debug: inside update_data_master_status"
    local server_uuid last_gtid
    master_status_file="${HA_RSCTMP}/master_status.${OCF_RESOURCE_INSTANCE}"
-   
+
    mysql_run -Q -sw -O $MYSQL $MYSQL_OPTIONS_REPL -BN -e "select variable_name,replace(variable_value,'\n','') as variable_value from performance_schema.global_variables where variable_name in ('server_uuid','gtid_executed')" > $master_status_file
-   
 }
 
+# @MySQLErrorSafe - doesn't touch MySQL
 # Returns the master status from the global variable, namely the uuid and last_gtid.
 # should be call after update_data_master_status for tmpfile
 get_master_status() {
-   ocf_log info "debug: inside get_master_status"
+   ocf_log debug "debug: inside get_master_status"
    local server_uuid last_gtid
    
    server_uuid=`cat $master_status_file | grep -i SERVER_UUID | awk '{ print $2 }'`
-   last_gtid=`cat $master_status_file | grep -i GTID_EXECUTED | sed "s/.*$server_uuid:[0-9]*-\([0-9]*\).*/\1/"`
-   
+
+    # First parse for pattern like UUID:X-Y, if matches then gtid is Y
+    # If no match parse for pattern like UUID:X, if match then gtid is X
+    # If no match then gtid is 0
+   last_gtid=`cat $master_status_file | grep -i GTID_EXECUTED | sed -n "s/.*$server_uuid:[0-9]*-\([0-9]*\).*/\1/p"`
+   if [ ! "$last_gtid" ]; then
+       last_gtid=`cat $master_status_file | grep -i GTID_EXECUTED | sed -n "s/.*$server_uuid:\([0-9]*\).*/\1/p"`
+       if [ ! "$last_gtid" ]; then
+            last_gtid=0
+       fi
+   fi
    echo "$server_uuid:$last_gtid"
 }
 
+# @MySQLErrorSafe - doesn't touch MySQL
 # Determines what IP address is attached to the current host.  The output of the
 # crm_attribute command looks like this:
 # scope=nodes  name=IP value=10.2.2.161
@@ -1204,7 +1411,7 @@ get_master_status() {
 # The ${INSTANCE_ATTR_NAME}_MYSQL_MASTER_IP is the IP address that will be used for the
 # change master to command.
 get_local_ip() {
-   ocf_log info "debug: inside get_local_ip"
+   ocf_log debug "debug: inside get_local_ip"
    local IP
    IP=`$CRM_ATTR -l forever -n ${INSTANCE_ATTR_NAME}_mysql_master_IP -q -G`
    if [ ! $? -eq 0 ]; then
@@ -1214,10 +1421,11 @@ get_local_ip() {
    fi
 }
 
+# # @MySQLErrorSafe - doesn't touch MySQL
 # Determine if the datadir is full or almost full, the threshold is 97%
 check_datadir_state() {
    # Get the free space of the binlogdir
-   ocf_log info "debug: inside check_datadir_state"
+   ocf_log debug "debug: inside check_datadir_state"
    FREE_SPC_PCT=`/bin/df -P $OCF_RESKEY_datadir | /bin/grep -v Filesystem \
                         | /bin/sed  -e 's/ \+/ /g' | /usr/bin/cut -d' ' -f 5 \
                         | /usr/bin/tr -d '%'`
@@ -1236,8 +1444,9 @@ check_datadir_state() {
 
 # Functions invoked by resource manager actions
 
+# @MySQLErrorSafe - doesn't touch MySQL
 mysql_validate() {
-   ocf_log info "debug: inside mysql_validate"
+   ocf_log debug "debug: inside mysql_validate"
    check_binary $OCF_RESKEY_binary
    check_binary  $OCF_RESKEY_client_binary
    
@@ -1266,11 +1475,12 @@ mysql_validate() {
    true
 }
 
+# @MySQLErrorSafe - doesn't touch MySQL
 # Return the status of mysqld
 # $1 the loglevel to use (mandatory)
 # $2 Override async_stop if 1, default to 0
 mysql_status() {
-   ocf_log info "debug: inside mysql_status"
+   ocf_log debug "debug: inside mysql_status"
    local last_restart_ts
    local kill_exit_code
    local witness_pid
@@ -1358,6 +1568,8 @@ mysql_status() {
             rc=$?
             
             if [ "$rc" -eq "0" ]; then
+            #Make sure we enable semi-sync as the master is starting, and enable it before we turn off read-only
+               chk_and_set_semi_sync_repl_master
                set_read_only OFF
             fi
             
@@ -1374,36 +1586,35 @@ mysql_status() {
 }
 
 mysql_monitor() {
-   ocf_log info "debug: inside mysql_monitor"
+   ocf_log debug "debug: inside mysql_monitor"
    local rc
    local status_loglevel="err"
    local master_resource
    local master_status_attr
    local new_master_status_attr
-   
+
    : ${OCF_RESKEY_CRM_meta_interval=0}
-   
+
    # Set loglevel to info during probe
    if ocf_is_probe; then
       status_loglevel="info"
    fi
-   
+
    mysql_status $status_loglevel
-   
+
    rc=$?
-   
+
    # TODO: check max connections error
-   
+
    # If status returned an error, return that immediately
    if [ $rc -ne $OCF_SUCCESS ]; then
       return $rc
    fi
-   
-   
+
    if [ $OCF_CHECK_LEVEL -gt 0 -a -n "$OCF_RESKEY_test_table" ]; then
       # Check if this instance is configured as a slave, and if so
       # check slave status
-      
+
       # Are we currently having a master?
       if [ "$glb_master_exists" -ne "0" ]; then
          is_slave
@@ -1412,28 +1623,37 @@ mysql_monitor() {
             check_slave
          else
             update_data_master_status
-            master_status_attr=`$CRM_ATTR_REPL_STATUS --query  -q`
-            new_master_status_attr="$(get_master_status)"
-            rm -f $master_status_file
-            if [ "$master_status_attr" != "$new_master_status_attr" ]; then
-               # Doing in bg, no need to wait and that can hang if a node is lost at the same time
-               $CRM_ATTR_REPL_STATUS -v "$new_master_status_attr" &
+            if [ -s $master_status_file ]; then
+               master_status_attr=`$CRM_ATTR_REPL_STATUS --query  -q`
+               new_master_status_attr="$(get_master_status)"
+               if [ "$master_status_attr" != "$new_master_status_attr" ]; then
+                  # Doing in bg, no need to wait and that can hang if a node is lost at the same time
+                  $CRM_ATTR_REPL_STATUS -v "$new_master_status_attr" &
+               fi
+            else
+               ocf_log warn "master status output is empty"
+               # the error will be caught & reported by test table check below
+               # as it can also deal with that max connection condition
             fi
+            rm -f $master_status_file
          fi
       else
          is_slave
          rc=$?
          if [ $rc -eq 0 -o "$OCF_RESKEY_CRM_meta_role" = "Slave" ]; then
-            unset_master
+            ocf_log warn "**UNSETTING MASTER**"
+            last_unset_ts=`$CRM_ATTR -l reboot --name last_unset --query -q --default=0`
+            unset_master_from_monitor
             set_reader_attr 0
-         fi
+          fi
+    
       fi
-      
+
       # Check for test table
       mysql_run -Q -sw $MYSQL $MYSQL_OPTIONS_TEST \
       -e "SELECT COUNT(*) FROM $OCF_RESKEY_test_table"
-      
-      
+
+
       if [ $MYSQL_LAST_ERR -ne "$MYSQL_TOO_MANY_CONN_ERR" ]; then
          if [ $MYSQL_LAST_ERR -ne 0 ]; then
             ocf_log err "Failed to select from $OCF_RESKEY_test_table";
@@ -1443,8 +1663,8 @@ mysql_monitor() {
          ocf_log info "Master hit max_connections"
       fi
    fi
-   
-   
+
+
    if ocf_is_ms && ! get_read_only; then
       ocf_log debug "MySQL monitor succeeded (master)";
       if [ "$OCF_RESKEY_CRM_meta_interval" -eq "0" ]; then
@@ -1466,7 +1686,7 @@ mysql_monitor() {
 
 # Start MySQL in the master-slave context
 mysql_start() {
-   ocf_log info "debug: inside mysql_start"
+   ocf_log debug "debug: inside mysql_start"
    local current_status
    
    if ocf_is_ms; then
@@ -1535,22 +1755,36 @@ mysql_start() {
       
       if [ "$glb_master_exists" -ne 0 -a "$glb_cib_master" != $(get_local_ip) ]; then
          ocf_log info "Changing MySQL configuration to replicate from $master_host."
+         
          set_master
          start_slave
          if [ $? -ne 0 ]; then
             ocf_log err "Failed to start slave"
             return $OCF_ERR_GENERIC
          fi
+         # assigning the score here.. see commented part below
+         set_master_score 1
       else
          ocf_log info "No MySQL master present - clearing replication state"
          unset_master
+         ocf_log info "Check- if the node was a previous master. If so, let us give it a score of 1 "
+         # so that in case no upto date slaves are found, this node has a chance to get elected again.
+         # By doing this, we are also preventing a slave to get a score of '1' if there is no master. 
+         # It will have the same score assigned to it from the unset_master call above
+         master_info=`$CRM_ATTR_REPL_INFO --query  -q`
+         master_IP=`echo $master_info | cut -d'|' -f1`
+         if [ "$master_IP" == $(get_local_ip) ]; then
+            set_master_score 1
+         fi
+
       fi
       
       # We also need to set a master preference, otherwise Pacemaker
       # won't ever promote us in the absence of any explicit
       # preference set by the administrator. We choose a low
       # greater-than-zero preference.
-      set_master_score 1
+      # commenting this code and moving the set_master_score within the above if \ else condition
+      # set_master_score 1
       
    fi
    
@@ -1570,9 +1804,10 @@ mysql_start() {
    return $OCF_SUCCESS
 }
 
+# @MySQLErrorSafe - doesn't attempt to connect to MySQL
 # low level MySQL start
 mysql_start_low() {
-   ocf_log info "debug: inside mysql_start_low"
+   ocf_log debug "debug: inside mysql_start_low"
    touch $OCF_RESKEY_log
    chown $OCF_RESKEY_user:$OCF_RESKEY_group $OCF_RESKEY_log
    chmod 0640 $OCF_RESKEY_log
@@ -1682,8 +1917,9 @@ mysql_start_low() {
    return $OCF_SUCCESS
 }
 
+# @MySQLErrorSafe - doesn't attempt to connect to MySQL
 mysql_stop() {
-   ocf_log info "debug: inside mysql_stop"
+   ocf_log debug "debug: inside mysql_stop"
    if ocf_is_ms; then
       # clear preference for becoming master
       $CRM_MASTER -D
@@ -1758,28 +1994,43 @@ mysql_stop() {
 }
 
 mysql_promote() {
-   ocf_log info "debug: inside mysql_promote"
+   ocf_log debug "debug: inside mysql_promote"
    local master_info
-   
+
    if ( ! mysql_status err ); then
       return $OCF_NOT_RUNNING
    fi
-   
+
+   # corner case timeout handling - there is a remote chance that there was a unset-master that was called
+   # but did not complete. Specifically, it timed out just before calling reset slave.
+   # It is a problem if it has turned off read-only to reset-slave, but timed out. So set read-only to ON 
+   # before calling unset_master below. [ otherwise, unset_master will simply return]
+
+    set_read_only ON
+
    unset_master
-   
+
    # Set Master Info in CIB, cluster level attribute
    update_data_master_status
-   master_info="$(get_local_ip)|$(get_master_status)"
-   ${CRM_ATTR_REPL_INFO} -v "$master_info"
-   rm -f $tmpfile
-   
+   if [ -s $master_status_file ]; then
+      master_info="$(get_local_ip)|$(get_master_status)"
+      ${CRM_ATTR_REPL_INFO} -v "$master_info"
+   else
+      rm -f $master_status_file
+      return $OCF_ERR_GENERIC
+   fi
+   rm -f $master_status_file
+
+   # Check and set this a semi sync repl master if reqd
+   chk_and_set_semi_sync_repl_master
+
    set_read_only off || return $OCF_ERR_GENERIC
-   
+
    # Existing master gets a higher-than-default master preference, so
    # the cluster manager does not shuffle the master role around
    # unnecessarily
    set_master_score 2147483647
-   
+
    # A master can accept reads
    set_reader_attr 1
    
@@ -1792,8 +2043,9 @@ mysql_promote() {
    return $OCF_SUCCESS
 }
 
+# @MySQLErrorSafe - doesn't attempt to connect to MySQL
 mysql_demote() {
-   ocf_log info "debug: inside mysql_demote"
+   ocf_log debug "debug: inside mysql_demote"
    if ! mysql_status err; then
       set_master_score 0
       exit $OCF_SUCCESS
@@ -1829,10 +2081,16 @@ mysql_notify() {
             # resets the slave after the completion of the IO and SQL
             # threads.  The post-demote doesn't run if the master host
             # crashed.
+
+            # corner case timeout handling - there is a remote chance that there was a unset-master that was called
+            # but did not complete. Specifically, it timed out just before calling reset slave.
+            # It is a problem if it has turned off read-only to reset-slave, but timed out. So set read-only to ON 
+            # before calling unset_master below. [ otherwise, unset_master will simply return]
+
+            set_read_only ON
             
             # First, we unset the master to let the SQL thread drain the
             # remaining relay log
-            
             unset_master
                            
          fi      
@@ -1886,7 +2144,7 @@ mysql_notify() {
          
          demote_host=`echo $OCF_RESKEY_CRM_meta_notify_demote_uname|tr -d " "`
          if [ $demote_host = ${HOSTNAME} ]; then
-            ocf_log info "post-demote notification for $demote_host"
+            ocf_log info "pre-demote notification for $demote_host"
             
             while ! get_read_only
             do
@@ -1910,7 +2168,7 @@ mysql_notify() {
                rm -f $tmpfile
             done
          else
-            ocf_log info "Ignoring post-demote notification execpt for my own demotion."
+            ocf_log info "Ignoring pre-demote notification except for my own demotion."
          fi
          return $OCF_SUCCESS
       ;;
@@ -1930,6 +2188,8 @@ mysql_notify() {
          fi
          ocf_log info "post-demote notification for $demote_host."
          # The former master has just been gracefully demoted.
+         # Note down the time when unset-master gets called.
+         $CRM_ATTR -l reboot --name last_unset -v `date +%s`
          unset_master
       ;;
       *)
