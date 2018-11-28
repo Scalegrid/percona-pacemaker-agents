@@ -29,3 +29,8 @@ mysql_prm_gtid
 
 The PRM resource agent for gtid based replication.
 
+
+mysql_prm_semisync
+------------------
+
+The PRM resource agent for Semisync replication. Supports 2 node and 3 node Async and Semisync Master-slave configurations. Better timeout management for operations. 
